@@ -42,10 +42,20 @@ GROUP = {"group", "supergroup"}
 P, S, D = "primary", "success", "danger"
 CYCLE = [P, S, D]
 
+# ==========================================
+# TEMPLATE BAWAAN (GLOBAL)
+# ==========================================
+DEFAULT_SETTINGS = {
+    "mute_text": "✅ Transaksi selesai!\n{name}, silakan isi <b>honest review</b> dulu ya supaya bisa chat lagi.",
+    "btn_review": "Isi Honest Review",
+    "notif_unmute": "✅ {name} sudah mengisi honest review dan di-unmute.",
+    "btn_limit": "⚠️ Jika Limit",
+    "btn_unmute": "🔓 Unmute"
+}
+SETTINGS = DEFAULT_SETTINGS.copy()
+
 DEFAULTS = {
     "command_name": "done",
-    "reply_text": "✅ Transaksi selesai!\n{name}, silakan isi <b>honest review</b> dulu ya supaya bisa chat lagi.",
-    "button_text": "Isi Honest Review",
 }
 
 MUTED = ChatPermissions(
@@ -64,12 +74,7 @@ ALLOW = ChatPermissions(
 PENDING: dict[int, set[int]] = {}
 KNOWN_USERS: set[int] = set()
 TASKS: set = set()
-
-# (group_id, user_id) -> message_id  (pesan bot "suruh isi HR" yang dikirim saat mute)
-# Disimpan di memory. Setelah restart, pesan lama tidak akan ter-delete otomatis,
-# tapi fungsionalitas mute/unmute tetap normal.
 MUTE_MSGS: dict[tuple[int, int], int] = {}
-
 
 class Cfg(StatesGroup):
     wait = State()
@@ -80,9 +85,11 @@ class Bc(StatesGroup):
 class Lmt(StatesGroup):
     wait = State()
 
+class Tpl(StatesGroup):
+    wait = State()
 
 # ==========================================
-# HELPERS
+# HELPERS & DATABASE SETTINGS
 # ==========================================
 def B(text, cb=None, url=None, style=None, emoji=None):
     kw = {"text": text}
@@ -96,14 +103,11 @@ def B(text, cb=None, url=None, style=None, emoji=None):
         kw["icon_custom_emoji_id"] = emoji
     return InlineKeyboardButton(**kw)
 
-
 def KB(*rows):
     return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
 
-
 async def db(fn):
     return await asyncio.to_thread(fn)
-
 
 def _fetch_all(table, cols):
     out, i = [], 0
@@ -115,14 +119,25 @@ def _fetch_all(table, cols):
             return out
         i += 1000
 
+async def load_settings():
+    global SETTINGS
+    try:
+        r = await db(lambda: supabase.table("bot_settings").select("*").execute())
+        data = {row["key"]: row["value"] for row in (r.data or [])}
+        SETTINGS = {**DEFAULT_SETTINGS, **data}
+        log.info("Global templates loaded.")
+    except Exception as e:
+        log.error(f"Failed to load settings: {e}")
+
+async def save_setting(key, value):
+    await db(lambda: supabase.table("bot_settings").upsert({"key": key, "value": value}).execute())
+    SETTINGS[key] = value
 
 def mention(u):
     return f'<a href="tg://user?id={u.id}">{html.escape(u.first_name or "User")}</a>'
 
-
 def norm_cmd(c):
     return (c or DEFAULTS["command_name"]).strip().lstrip("/.!").lower()
-
 
 def split_button(raw):
     emoji_id = None
@@ -130,9 +145,8 @@ def split_button(raw):
     if m:
         emoji_id = m.group(1)
     t = re.sub(r"<tg-emoji[^>]*>.*?</tg-emoji>", "", raw)
-    t = html.unescape(re.sub(r"<[^>]+>", "", t)).strip() or DEFAULTS["button_text"]
+    t = html.unescape(re.sub(r"<[^>]+>", "", t)).strip()
     return t[:64], emoji_id
-
 
 def review_url(cfg):
     if cfg.get("channel_link"):
@@ -141,21 +155,20 @@ def review_url(cfg):
         return "https://t.me/c/" + str(cfg["comsect_id"]).replace("-100", "", 1)
     return None
 
-
 def review_kb(cfg, extra=None):
     rows = []
     url = review_url(cfg)
     if url:
-        t, e = split_button(cfg.get("button_text") or DEFAULTS["button_text"])
+        t, e = split_button(cfg.get("button_text") or SETTINGS["btn_review"])
         rows.append([B(t, url=url, style=P, emoji=e)])
     if extra:
         rows.append(extra)
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
-
 def render_wording(cfg, who):
-    return (cfg.get("reply_text") or DEFAULTS["reply_text"]).replace("{name}", who)
-
+    # Menggunakan settingan grup, jika kosong gunakan settingan global
+    txt = cfg.get("reply_text") or SETTINGS["mute_text"]
+    return txt.replace("{name}", who)
 
 async def check_subs(uid):
     try:
@@ -166,14 +179,12 @@ async def check_subs(uid):
     except Exception:
         return False
 
-
 async def is_admin(chat_id, uid):
     try:
         m = await bot.get_chat_member(chat_id, uid)
         return m.status in ("administrator", "creator")
     except Exception:
         return False
-
 
 async def show(ev, text, kb=None):
     if isinstance(ev, CallbackQuery):
@@ -187,7 +198,6 @@ async def show(ev, text, kb=None):
     else:
         await ev.answer(text, reply_markup=kb)
 
-
 async def save_user(u):
     if u.id in KNOWN_USERS:
         return
@@ -199,7 +209,6 @@ async def save_user(u):
     except Exception as e:
         log.error(f"save_user: {e}")
 
-
 async def get_cfg(gid, owner=None):
     def q():
         x = supabase.table("group_configs").select("*").eq("group_id", gid)
@@ -209,21 +218,17 @@ async def get_cfg(gid, owner=None):
     r = await db(q)
     return r.data[0] if r.data else None
 
-
 async def my_groups(uid):
     r = await db(lambda: supabase.table("group_configs").select("*").eq("owner_id", uid).execute())
     return r.data or []
-
 
 async def count(table):
     r = await db(lambda: supabase.table(table).select("*", count="exact").limit(1).execute())
     return r.count or 0
 
-
 async def set_pending(uid, gid):
     await db(lambda: supabase.table("pending_reviews").upsert({"user_id": uid, "group_id": gid}).execute())
     PENDING.setdefault(uid, set()).add(gid)
-
 
 async def clear_pending(uid, gid):
     await db(lambda: supabase.table("pending_reviews").delete().eq("user_id", uid).eq("group_id", gid).execute())
@@ -232,9 +237,7 @@ async def clear_pending(uid, gid):
         if not PENDING[uid]:
             del PENDING[uid]
 
-
 async def delete_mute_msg(gid, uid):
-    """Hapus pesan bot 'suruh isi HR' kalau masih ada di memory."""
     mid = MUTE_MSGS.pop((gid, uid), None)
     if not mid:
         return
@@ -242,7 +245,6 @@ async def delete_mute_msg(gid, uid):
         await bot.delete_message(gid, mid)
     except Exception as e:
         log.warning(f"delete_mute_msg: {e}")
-
 
 async def purge_group(gid):
     await db(lambda: supabase.table("pending_reviews").delete().eq("group_id", gid).execute())
@@ -255,7 +257,6 @@ async def purge_group(gid):
         if key[0] == gid:
             MUTE_MSGS.pop(key, None)
 
-
 async def unmute(gid, uid):
     try:
         ch = await bot.get_chat(gid)
@@ -265,7 +266,6 @@ async def unmute(gid, uid):
     except Exception as e:
         log.error(f"unmute: {e}")
         return False
-
 
 # ==========================================
 # TEKS & KEYBOARD
@@ -299,34 +299,32 @@ PROMPTS = {
     "bt": "🔘 Kirim teks tombol (maks 64 karakter).\nEmoji premium akan jadi ikon tombol.",
 }
 
-
 def home_kb(uid):
     rows = [
         [B("➕ Tambah Grup", cb="add", style=P), B("📋 Grup Saya", cb="mine", style=S)],
         [B("📖 Panduan", cb="help")],
     ]
     if uid == OWNER_BOT_ID:
+        rows.append([B("⚙️ Template Pesan", cb="tpl", style=S)])
         rows.append([B("📢 Broadcast", cb="bc", style=D), B("📊 Statistik", cb="stat", style=P)])
     return KB(*rows)
-
 
 def join_kb():
     return KB([B("📢 Join Channel", url=FORCE_SUBS_LINK, style=P)],
               [B("✅ Saya Sudah Join", cb="chk", style=S)])
 
-
 def group_text(cfg):
     n = norm_cmd(cfg.get("command_name"))
     post_line = f"📌 Post review: <code>#{cfg['review_post_id']}</code>\n" if cfg.get("review_post_id") else ""
+    bt_text = split_button(cfg.get("button_text") or SETTINGS['btn_review'])[0]
     return (
         f"⚙️ <b>{html.escape(cfg.get('title') or 'Grup')}</b>\n<code>{cfg['group_id']}</code>\n\n"
         f"🔗 Channel: {html.escape(cfg.get('channel_link') or '— belum diatur')}\n{post_line}"
         f"💬 Comsect ID: <code>{cfg.get('comsect_id') or '—'}</code>\n"
         f"⌨️ Command: <code>/{n}</code> · <code>.{n}</code>\n"
-        f"📝 Wording:\n<blockquote>{cfg.get('reply_text') or DEFAULTS['reply_text']}</blockquote>\n"
-        f"🔘 Tombol: {html.escape(split_button(cfg.get('button_text') or DEFAULTS['button_text'])[0])}"
+        f"📝 Wording:\n<blockquote>{cfg.get('reply_text') or SETTINGS['mute_text']}</blockquote>\n"
+        f"🔘 Tombol: {html.escape(bt_text)}"
     )
-
 
 def group_kb(gid):
     return KB(
@@ -336,14 +334,11 @@ def group_kb(gid):
         [B("🗑 Hapus Grup", cb=f"del:{gid}", style=D), B("⬅️ Kembali", cb="mine")],
     )
 
-
 async def show_group(ev, cfg):
     await show(ev, group_text(cfg), group_kb(cfg["group_id"]))
 
-
 def cfg_link_kb(gid):
     return KB([B("⚙️ Atur di PM Bot", url=f"https://t.me/{BOT_USERNAME}?start=cfg_{gid}", style=P)])
-
 
 # ==========================================
 # MIDDLEWARE
@@ -372,10 +367,8 @@ class Gate(BaseMiddleware):
         else:
             await ev.answer(JOIN_TEXT, reply_markup=join_kb())
 
-
 dp.message.outer_middleware(Gate())
 dp.callback_query.outer_middleware(Gate())
-
 
 # ==========================================
 # PRIVATE: MENU UTAMA
@@ -414,7 +407,6 @@ async def start_cmd(m: Message, command: CommandObject, state: FSMContext):
             )
 
     await show(m, HOME_TEXT, home_kb(m.from_user.id))
-
 
 @dp.message(Lmt.wait, F.chat.type == "private")
 async def limit_review_handler(m: Message, state: FSMContext):
@@ -464,11 +456,12 @@ async def limit_review_handler(m: Message, state: FSMContext):
             )
 
         if await unmute(gid, uid):
-            await delete_mute_msg(gid, uid)  # hapus pesan "suruh isi HR"
+            await delete_mute_msg(gid, uid)
             await clear_pending(uid, gid)
             await m.answer("✅ <b>Review terkirim!</b>\nKamu sudah otomatis di-unmute di grup.")
             try:
-                await bot.send_message(gid, f"✅ {mention(u)} telah mengirim review via Bot (Limit) dan berhasil di-unmute.")
+                notif = SETTINGS["notif_unmute"].replace("{name}", mention(u))
+                await bot.send_message(gid, notif)
             except Exception:
                 pass
         else:
@@ -479,7 +472,6 @@ async def limit_review_handler(m: Message, state: FSMContext):
         log.error(f"Limit review error: {e}")
         await m.answer(f"❌ Gagal meneruskan pesan ke comsect. Pastikan bot dijadikan admin penuh di comsect.\nError: {e}")
 
-
 @dp.callback_query(F.data == "chk")
 async def cb_chk(c: CallbackQuery):
     if await check_subs(c.from_user.id):
@@ -489,19 +481,16 @@ async def cb_chk(c: CallbackQuery):
     else:
         await c.answer("❌ Kamu belum join channel!", show_alert=True)
 
-
 @dp.callback_query(F.data == "home")
 async def cb_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, HOME_TEXT, home_kb(c.from_user.id))
     await c.answer()
 
-
 @dp.callback_query(F.data == "help")
 async def cb_help(c: CallbackQuery):
     await show(c, HELP_TEXT, KB([B("⬅️ Kembali", cb="home")]))
     await c.answer()
-
 
 @dp.callback_query(F.data == "add")
 async def cb_add(c: CallbackQuery):
@@ -515,7 +504,6 @@ async def cb_add(c: CallbackQuery):
     )
     await show(c, text, KB([B("➕ Tambahkan Bot ke Grup", url=url, style=P)], [B("⬅️ Kembali", cb="home")]))
     await c.answer()
-
 
 @dp.callback_query(F.data == "mine")
 async def cb_mine(c: CallbackQuery, state: FSMContext):
@@ -531,7 +519,6 @@ async def cb_mine(c: CallbackQuery, state: FSMContext):
         await show(c, f"📋 <b>Grup Saya</b> ({len(gs)}/{MAX_GROUPS})\nPilih grup untuk diatur:", KB(*rows))
     await c.answer()
 
-
 # ==========================================
 # PRIVATE: PENGATURAN GRUP
 # ==========================================
@@ -544,7 +531,6 @@ async def cb_group(c: CallbackQuery, state: FSMContext):
     await show_group(c, cfg)
     await c.answer()
 
-
 @dp.callback_query(F.data.startswith("s:"))
 async def cb_set(c: CallbackQuery, state: FSMContext):
     _, field, gid = c.data.split(":")
@@ -555,7 +541,6 @@ async def cb_set(c: CallbackQuery, state: FSMContext):
     await state.update_data(gid=gid, field=field)
     await show(c, PROMPTS[field], KB([B("❌ Batal", cb=f"g:{gid}", style=D)]))
     await c.answer()
-
 
 @dp.callback_query(F.data.startswith("pv:"))
 async def cb_preview(c: CallbackQuery):
@@ -569,14 +554,12 @@ async def cb_preview(c: CallbackQuery):
     except TelegramBadRequest:
         await c.answer("Wording/tombol tidak valid, set ulang.", show_alert=True)
 
-
 @dp.callback_query(F.data.startswith("del:"))
 async def cb_del(c: CallbackQuery):
     gid = int(c.data[4:])
     await show(c, "🗑 Yakin hapus grup ini dari bot?",
                KB([B("Ya, Hapus", cb=f"delok:{gid}", style=D), B("Batal", cb=f"g:{gid}", style=S)]))
     await c.answer()
-
 
 @dp.callback_query(F.data.startswith("delok:"))
 async def cb_delok(c: CallbackQuery):
@@ -585,7 +568,6 @@ async def cb_delok(c: CallbackQuery):
         await purge_group(gid)
     await show(c, "✅ Grup dihapus.", KB([B("📋 Grup Saya", cb="mine", style=P)]))
     await c.answer()
-
 
 async def bot_note(cid):
     try:
@@ -597,7 +579,6 @@ async def bot_note(cid):
     except Exception:
         pass
     return "\n⚠️ Bot belum ada di comsect. Masukkan bot & jadikan admin."
-
 
 async def resolve_channel(m: Message):
     chat, post = None, None
@@ -655,7 +636,6 @@ async def resolve_channel(m: Message):
         return upd, "Link review & comsect terdeteksi" + pnote + "." + await bot_note(linked), True
     return upd, "Link tersimpan" + pnote + ", tapi channel tidak punya grup diskusi.\nKirim ID comsect (angka) manual.", False
 
-
 @dp.message(Cfg.wait, F.chat.type == "private")
 async def cfg_input(m: Message, state: FSMContext):
     d = await state.get_data()
@@ -693,6 +673,69 @@ async def cfg_input(m: Message, state: FSMContext):
         cfg = await get_cfg(gid)
         await m.answer(group_text(cfg), reply_markup=group_kb(gid))
 
+# ==========================================
+# PRIVATE: TEMPLATE PESAN (OWNER)
+# ==========================================
+TPL_KEYS = {
+    "mute_text": "📝 Teks Mute",
+    "btn_review": "🔘 Tombol Isi HR",
+    "notif_unmute": "🔔 Notif Unmute",
+    "btn_limit": "⚠️ Tombol Limit",
+    "btn_unmute": "🔓 Tombol Unmute"
+}
+
+async def render_tpl_menu(ev):
+    rows = []
+    for k, label in TPL_KEYS.items():
+        rows.append([B(f"{label}: {split_button(SETTINGS.get(k))[0][:20]}...", cb=f"tpl:{k}")])
+    rows.append([B("⬅️ Kembali", cb="home")])
+    await show(ev, "⚙️ <b>Pengaturan Template Global</b>\nPilih teks/tombol yang ingin diubah:\n\n" 
+                   "<i>Pengaturan ini berlaku untuk semua grup, kecuali grup tersebut sudah mengatur teksnya sendiri di menu pengaturan grup.</i>", KB(*rows))
+
+@dp.callback_query(F.data == "tpl")
+async def cb_tpl(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != OWNER_BOT_ID:
+        return await c.answer()
+    await state.clear()
+    await render_tpl_menu(c)
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("tpl:"))
+async def cb_tpl_edit(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != OWNER_BOT_ID:
+        return await c.answer()
+    key = c.data.split(":")[1]
+    await state.set_state(Tpl.wait)
+    await state.update_data(key=key)
+    
+    info = "(Gunakan {name} untuk mention member)" if key in ("mute_text", "notif_unmute") else "(Emoji premium didukung)"
+    await show(c, f"Kirim teks baru untuk <b>{TPL_KEYS.get(key, key)}</b>.\n\nNilai saat ini:\n<blockquote>{SETTINGS.get(key)}</blockquote>\n\n{info}", KB([B("❌ Batal", cb="tpl", style=D)]))
+    await c.answer()
+
+@dp.message(Tpl.wait, F.chat.type == "private")
+async def tpl_input(m: Message, state: FSMContext):
+    if m.from_user.id != OWNER_BOT_ID:
+        return
+    d = await state.get_data()
+    key = d.get("key")
+    if not key or not m.text:
+        await state.clear()
+        return await m.answer("Gagal menyimpan.")
+
+    val = m.html_text[:1000]
+    if key in ("btn_review", "btn_limit", "btn_unmute"):
+        t, e = split_button(val)
+        if not t:
+            return await m.answer("⚠️ Teks tombol tidak boleh kosong.")
+    
+    await save_setting(key, val)
+    await state.clear()
+    
+    rows = []
+    for k, label in TPL_KEYS.items():
+        rows.append([B(f"{label}: {split_button(SETTINGS.get(k))[0][:20]}...", cb=f"tpl:{k}")])
+    rows.append([B("⬅️ Kembali", cb="home")])
+    await m.answer(f"✅ Template <b>{TPL_KEYS.get(key)}</b> berhasil diperbarui!\n\n⚙️ <b>Pengaturan Template Global</b>\nPilih teks/tombol yang ingin diubah:", reply_markup=KB(*rows))
 
 # ==========================================
 # PRIVATE: BROADCAST & STATISTIK (OWNER)
@@ -702,12 +745,10 @@ async def start_bc(ev, state: FSMContext):
     await show(ev, "📢 <b>Broadcast</b>\nKirim pesan yang mau disebar (teks/foto/video/dll, format & emoji premium ikut).",
                KB([B("❌ Batal", cb="home", style=D)]))
 
-
 @dp.message(Command("broadcast"), F.chat.type == "private")
 async def cmd_bc(m: Message, state: FSMContext):
     if m.from_user.id == OWNER_BOT_ID:
         await start_bc(m, state)
-
 
 @dp.callback_query(F.data == "bc")
 async def cb_bc(c: CallbackQuery, state: FSMContext):
@@ -715,7 +756,6 @@ async def cb_bc(c: CallbackQuery, state: FSMContext):
         return await c.answer()
     await start_bc(c, state)
     await c.answer()
-
 
 @dp.callback_query(F.data == "stat")
 async def cb_stat(c: CallbackQuery):
@@ -725,7 +765,6 @@ async def cb_stat(c: CallbackQuery):
     await show(c, f"📊 <b>Statistik</b>\n\n👥 User: <b>{u}</b>\n🏘 Grup: <b>{g}</b>\n⏳ Pending review: <b>{p}</b>",
                KB([B("⬅️ Kembali", cb="home")]))
     await c.answer()
-
 
 @dp.message(Bc.wait, F.chat.type == "private")
 async def bc_msg(m: Message, state: FSMContext):
@@ -741,7 +780,6 @@ async def bc_msg(m: Message, state: FSMContext):
             [B("❌ Batal", cb="home", style=D)],
         ),
     )
-
 
 async def run_broadcast(from_chat, mid, pin, status):
     ids = [r["user_id"] for r in await db(lambda: _fetch_all("bot_users", "user_id"))]
@@ -773,7 +811,6 @@ async def run_broadcast(from_chat, mid, pin, status):
     except Exception:
         pass
 
-
 @dp.callback_query(F.data.startswith("bcgo:"))
 async def cb_bcgo(c: CallbackQuery, state: FSMContext):
     if c.from_user.id != OWNER_BOT_ID:
@@ -788,7 +825,6 @@ async def cb_bcgo(c: CallbackQuery, state: FSMContext):
     t = asyncio.create_task(run_broadcast(d["cid"], d["mid"], pin, c.message))
     TASKS.add(t)
     t.add_done_callback(TASKS.discard)
-
 
 # ==========================================
 # GRUP: REGISTRASI
@@ -805,11 +841,12 @@ async def register_group(chat, user):
         if len(await my_groups(user.id)) >= MAX_GROUPS:
             return False, f"❌ Limit maksimal {MAX_GROUPS} grup per akun tercapai."
         try:
+            # Mengosongkan reply_text & button_text agar grup otomatis menggunakan template global
             await db(lambda: supabase.table("group_configs").insert({
                 "group_id": chat.id, "owner_id": user.id, "title": chat.title,
                 "command_name": DEFAULTS["command_name"],
-                "reply_text": DEFAULTS["reply_text"],
-                "button_text": DEFAULTS["button_text"],
+                "reply_text": None,
+                "button_text": None,
             }).execute())
         except Exception as e:
             return False, f"❌ Gagal mendaftarkan grup: {e}"
@@ -822,7 +859,6 @@ async def register_group(chat, user):
         pass
     return True, text
 
-
 @dp.message(Command("init"), F.chat.type.in_(GROUP))
 async def init_cmd(m: Message):
     if not m.from_user:
@@ -830,13 +866,11 @@ async def init_cmd(m: Message):
     ok, text = await register_group(m.chat, m.from_user)
     await m.reply(text, reply_markup=cfg_link_kb(m.chat.id) if ok else None)
 
-
 @dp.callback_query(F.data == "reg")
 async def cb_reg(c: CallbackQuery):
     ok, text = await register_group(c.message.chat, c.from_user)
     await c.answer()
     await c.message.edit_text(text, reply_markup=cfg_link_kb(c.message.chat.id) if ok else None)
-
 
 @dp.my_chat_member(F.chat.type.in_(GROUP))
 async def on_member(ev):
@@ -855,7 +889,6 @@ async def on_member(ev):
         except Exception:
             pass
 
-
 # ==========================================
 # GRUP: MUTE & UNMUTE
 # ==========================================
@@ -866,7 +899,7 @@ async def cb_um(c: CallbackQuery):
     if not await is_admin(gid, c.from_user.id):
         return await c.answer("Hanya admin yang bisa.", show_alert=True)
     if await unmute(gid, uid):
-        MUTE_MSGS.pop((gid, uid), None)  # pesan di-edit (bukan dihapus) jadi cukup bersihkan map
+        MUTE_MSGS.pop((gid, uid), None)
         await clear_pending(uid, gid)
         await c.answer("Di-unmute")
         await c.message.edit_text(
@@ -874,9 +907,7 @@ async def cb_um(c: CallbackQuery):
     else:
         await c.answer("Gagal unmute, cek hak admin bot.", show_alert=True)
 
-
 THREADS: dict = {}
-
 
 def comment_post(m: Message):
     rm = m.reply_to_message
@@ -888,7 +919,6 @@ def comment_post(m: Message):
     tid = getattr(m, "message_thread_id", None)
     return THREADS.get((m.chat.id, tid)) if tid else None
 
-
 async def try_unmute(m: Message):
     uid = m.from_user.id
     for gid in list(PENDING.get(uid, ())):
@@ -898,13 +928,13 @@ async def try_unmute(m: Message):
             if post and comment_post(m) != post:
                 continue
             if await unmute(gid, uid):
-                await delete_mute_msg(gid, uid)  # hapus pesan "suruh isi HR"
+                await delete_mute_msg(gid, uid)
                 await clear_pending(uid, gid)
                 try:
-                    await bot.send_message(gid, f"✅ {mention(m.from_user)} sudah mengisi honest review dan di-unmute.")
+                    notif = SETTINGS["notif_unmute"].replace("{name}", mention(m.from_user))
+                    await bot.send_message(gid, notif)
                 except Exception:
                     pass
-
 
 async def try_mute(m: Message):
     first = m.text.strip().split(maxsplit=1)[0].lower()
@@ -916,20 +946,17 @@ async def try_mute(m: Message):
     if not cfg or name != norm_cmd(cfg.get("command_name")):
         return
 
-    # ==== WAJIB reply ke member yang mau di-mute ====
     if not m.reply_to_message:
         return
     target = m.reply_to_message.from_user
     if not target:
         return
 
-    # Validasi pengirim command: anon admin / owner bot / admin grup
     anon = bool(m.sender_chat and m.sender_chat.id == gid)
     sender = m.from_user.id if m.from_user else None
     if not (anon or sender == cfg["owner_id"] or (sender and await is_admin(gid, sender))):
         return
 
-    # Guard: jangan pernah mute diri sendiri / bot / service account / admin lain
     if sender is not None and target.id == sender:
         return
     if target.is_bot or target.id == 777000 or await is_admin(gid, target.id):
@@ -942,18 +969,19 @@ async def try_mute(m: Message):
         text = render_wording(cfg, who) + f"\n\n🔇 {who} di-mute sampai review selesai."
 
         limit_url = f"https://t.me/{BOT_USERNAME}?start=limit_{gid}"
+        
+        t_limit, e_limit = split_button(SETTINGS["btn_limit"])
+        t_um, e_um = split_button(SETTINGS["btn_unmute"])
         extra_btns = [
-            B("⚠️ Jika Limit", url=limit_url),
-            B("🔓 Unmute", cb=f"um:{gid}:{target.id}", style=S)
+            B(t_limit, url=limit_url, emoji=e_limit),
+            B(t_um, cb=f"um:{gid}:{target.id}", style=S, emoji=e_um)
         ]
 
-        sent = await m.reply(text, reply_markup=review_kb(cfg, extra_btns))
-        # Simpan ID pesan "suruh isi HR" agar bisa dihapus saat unmute
+        sent = await m.reply_to_message.reply(text, reply_markup=review_kb(cfg, extra_btns))
         if sent:
             MUTE_MSGS[(gid, target.id)] = sent.message_id
     except Exception as e:
         await m.reply(f"❌ Bot gagal mute. Pastikan bot admin dengan hak Restrict Users.\nError: {e}")
-
 
 @dp.message(F.chat.type.in_(GROUP))
 async def group_handler(m: Message):
@@ -969,14 +997,12 @@ async def group_handler(m: Message):
     if m.reply_to_message and m.text and m.text[0] in "/.!":
         await try_mute(m)
 
-
 # ==========================================
 # FALLBACK PRIVATE
 # ==========================================
 @dp.message(F.chat.type == "private")
 async def fallback(m: Message):
     await show(m, HOME_TEXT, home_kb(m.from_user.id))
-
 
 # ==========================================
 # MAIN
@@ -985,12 +1011,12 @@ async def main():
     global BOT_ID, BOT_USERNAME
     me = await bot.get_me()
     BOT_ID, BOT_USERNAME = me.id, me.username
+    await load_settings()
     for r in await db(lambda: _fetch_all("pending_reviews", "user_id,group_id")):
         PENDING.setdefault(r["user_id"], set()).add(r["group_id"])
     print("Bot is running...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
 
 if __name__ == "__main__":
     asyncio.run(main())
